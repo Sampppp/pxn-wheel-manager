@@ -9,7 +9,7 @@ const tabs = [
 
 export default function SideNav({ active, onChange }: { active: string; onChange: (t: string) => void }) {
   return (
-    <aside className="w-64 h-screen bg-[#0b0b14] border-r border-white/5 flex flex-col shrink-0">
+    <aside className="w-64 h-[calc(100vh-2.5rem)] pt-10 bg-[#0b0b14] border-r border-white/5 flex flex-col shrink-0">
       <div className="p-6">
         <h1 className="text-xl font-black tracking-tighter text-white leading-none">
           PXN <span className="text-[#ff2a2a]">PIT</span>

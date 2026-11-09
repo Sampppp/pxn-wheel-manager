@@ -75,8 +75,10 @@ def disconnect_wheel():
 # ------------------------------------------------------------------
 
 
-# Serve built React frontend (build with: cd frontend && npm run build)
-app.mount("/", StaticFiles(directory="/home/spak/wb/frontend/dist", html=True), name="static")
+# Serve built React frontend (build with: cd frontend && npm install && npm run build)
+_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_static_dir = os.path.join(_project_root, "frontend", "dist")
+app.mount("/", StaticFiles(directory=_static_dir, html=True), name="static")
 
 def run_server():
     uvicorn.run(app, host="127.0.0.1", port=8120, log_level="warning")
@@ -95,8 +97,9 @@ def launch_desktop():
             url="http://127.0.0.1:8120",
             width=1200,
             height=800,
-            frameless=True,
+            min_size=(900, 600),
             easy_drag=True,
+            resizable=True,
             shadow=True,
             transparent=False,
         )

@@ -29,8 +29,16 @@ export default function App() {
 
   return (
     <div className="flex h-screen w-screen bg-[#0f0f1a] text-slate-100 overflow-hidden selection:bg-[#ff2a2a]/30">
+      {/* Frameless drag handle / title bar */}
+      <div className="fixed top-0 left-0 right-0 h-10 z-50 flex items-center justify-between px-4 bg-[#0f0f1a]/90 backdrop-blur-md border-b border-white/[0.06] select-none" style={{ WebkitAppRegion: 'drag' } as any}>
+        <div className="flex items-center gap-2">
+          <div className="w-2 h-2 rounded-full bg-[#ff2a2a]" />
+          <span className="text-xs font-bold tracking-widest text-slate-300">PXN CUSTOM MANAGER</span>
+        </div>
+        <span className="text-[10px] text-slate-500">Drag to move · Resize from edges</span>
+      </div>
       <SideNav active={tab} onChange={setTab} />
-      <main className="flex-1 overflow-y-auto p-8 md:p-12 scroll-smooth">
+      <main className="flex-1 overflow-y-auto p-8 md:p-12 pt-16 scroll-smooth">
         <header className="mb-10 flex items-center justify-between">
           <div>
             <h1 className="text-4xl font-black tracking-tighter text-white">Pit House</h1>
