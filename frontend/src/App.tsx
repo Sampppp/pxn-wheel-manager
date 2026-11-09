@@ -13,7 +13,7 @@ export default function App() {
   const load = useCallback(async () => {
     try {
       const res = await fetchSettings();
-      setState(res.data ?? {});
+      setState({ ...(res.data ?? {}), connected: res.connected ?? false });
     } catch (e) {
       // silent fail
     }

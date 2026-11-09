@@ -3,7 +3,7 @@ import React from "react";
 export default function Dashboard({ state }: { state: any }) {
   const angle = state?.Rotation_Angle ?? 540;
   const ffb = state?.FFB_Gain ?? 50;
-  const connected = state?._connected ?? true;
+  const connected = state?.connected ?? false;
   return (
     <section className="space-y-8">
       <div className="flex items-center gap-3 mb-2">
