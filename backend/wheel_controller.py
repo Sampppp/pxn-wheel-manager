@@ -27,9 +27,10 @@ import struct
 from typing import Optional, Dict, Any, List
 
 try:
-    import hid
+    import usb.core
+    import usb.util
 except ImportError as exc:
-    raise ImportError("hidapi (python-hid) is required. Install: pip install hid") from exc
+    raise ImportError("pyusb is required. Install: pip install pyusb") from exc
 
 
 class PXNController:
@@ -57,7 +58,7 @@ class PXNController:
     }
 
     def __init__(self):
-        self.device: Optional[hid.device] = None
+        self.device = None  # pyusb device
         self._connected = False
         self._lock = threading.RLock()
 
@@ -89,9 +90,13 @@ class PXNController:
                 return True
             for attempt in range(1, retries + 1):
                 try:
-                    self.device = hid.device()
-                    self.device.open(self.VID, self.PID)
-                    # Set non-blocking read (optional) and claim interface
+                    self.device = usb.core.find(idVendor=self.VID, idProduct=self.PID)
+                    if self.device is None:
+                        continue
+                    self.device.set_configuration()
+                    usb.util.claim_interface(self.device, 0)
+                    self._connected = True
+                    return True
                     self.device.set_nonblocking(1)
                     self._connected = True
                     return True
@@ -114,7 +119,8 @@ class PXNController:
         with self._lock:
             try:
                 if self.device is not None:
-                    self.device.close()
+                    usb.util.release_interface(self.device, 0)
+                    usb.util.dispose_resources(self.device)
             except Exception:
                 pass
             finally:
@@ -262,19 +268,19 @@ class PXNController:
             return False
 
     def _send_raw(self, packet: bytearray) -> bool:
-        """Send raw bytearray via HID with busy-device retry."""
+        """Send raw bytearray via pyusb with busy-device retry."""
         if not self.is_connected():
             return False
         try:
-            # Use report ID 100 for profile/config (matches original usb_write patterns)
-            self.device.write(self.REPORT_ID_CONFIG, packet)
+            # Endpoint 3 OUT (profile/config) — address 0x03
+            self.device.write(0x03, packet, timeout=500)
             return True
-        except OSError as exc:
+        except usb.core.USBError as exc:
             msg = str(exc).lower()
-            if "busy" in msg or "resource" in msg:
+            if "busy" in msg or "resource" in msg or "timeout" in msg:
                 time.sleep(0.1)
                 try:
-                    self.device.write(self.REPORT_ID_CONFIG, packet)
+                    self.device.write(0x03, packet, timeout=500)
                     return True
                 except Exception:
                     return False
@@ -292,7 +298,7 @@ class PXNController:
             return None
         try:
             # hid.device.read(length) reads from the device; endpoint 131 is report 131
-            data = self.device.read(self.READ_REPORT_LEN)
+            data = self.device.read(0x83, self.READ_REPORT_LEN, timeout=1000)
             if data is None or len(data) < 27:
                 return None
             # Rotation angle (bytes 1-2, little-endian uint16 / 65535)

@@ -41,3 +41,16 @@ The frameless dark window opens at `http://127.0.0.1:8120`. The backend serves `
 - Connect PXN wheelbase via USB
 - VID `0x11FF` (4607), PID `0x1212` (4626)
 - If device busy, retry after 1-2 seconds
+
+## No hid / No PyQt6 needed
+
+- `wheel_controller.py` now uses `pyusb` (not `hid`). Install with `pip install pyusb`.
+- `pywebview` uses Windows Edge WebView2 by default; no Qt needed.
+- If `pywebview` still fails, install `PyQt6-WebEngine` via pip (`pip install PyQt6-WebEngine`) as fallback.
+
+## Building frontend without npm in PowerShell
+
+If `npm` is unavailable:
+1. Build on Linux/Mac: `cd frontend && npm install && npm run build`
+2. Copy the resulting `frontend/dist/` folder to Windows (`scp`, USB, etc.)
+3. Place it next to `backend/` so `main.py` finds `/home/spak/wb/pxn-wheel-manager/frontend/dist/` (adjust path in `main.py` if needed)
