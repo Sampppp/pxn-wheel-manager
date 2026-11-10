@@ -18,13 +18,13 @@ REVERSE-ENGINEERING NOTE (from pxn_usb_decompiled.py / config_decompiled.py):
 
 import sys
 import time
+import os
 
-# Use pyusb (same library imported by pxn_usb_decompiled.py)
+# Use hidapi (which we verified works on this system) instead of pyusb
 try:
-    import usb.core
-    import usb.util
+    import hid
 except ImportError as exc:
-    print("ERROR: pyusb not installed. Install with: pip install pyusb")
+    print("ERROR: hidapi not installed. Install with: pip install hidapi")
     sys.exit(1)
 
 # --- Device identification (from config_decompiled.py) ---
@@ -48,27 +48,39 @@ packet[2] = (ANGLE_UINT16 >> 8) & 0xFF
 # Bytes 3-63 left as 0 (unknown fields; could contain damper/friction/FFB)
 
 # --- Connection with robust error handling ---
-def connect_device(max_retries=3, delay=0.5):
-    for attempt in range(1, max_retries + 1):
-        try:
-            dev = usb.core.find(idVendor=VID, idProduct=PID)
-            if dev is None:
-                raise usb.core.USBError("Device not found (VID=0x%04X PID=0x%04X)" % (VID, PID))
-            # Set configuration (required for HID devices)
-            dev.set_configuration()
-            # Claim interface 0 (standard for this wheelbase)
-            usb.util.claim_interface(dev, 0)
-            return dev
-        except usb.core.USBError as exc:
-            msg = str(exc)
-            if "busy" in msg.lower() or "resource" in msg.lower() or "timeout" in msg.lower():
-                print("Device busy (attempt %d/%d): %s" % (attempt, max_retries, msg))
-                if attempt < max_retries:
-                    time.sleep(delay * attempt)
-                    continue
-            print("USB error (attempt %d/%d): %s" % (attempt, max_retries, msg))
-            raise
-    raise usb.core.USBError("Failed to connect after %d attempts" % max_retries)
+def connect_device():
+    """
+    Connects to the PXN wheelbase using hidapi.
+    Since the device has multiple interfaces, we look for the one that 
+    matches the vendor-defined usage page (0xFF00 / 65280) if possible,
+    or simply try to open the device by VID/PID.
+    """
+    try:
+        # Try to find the specific interface for vendor-defined reports
+        devices = hid.enumerate(VID, PID)
+        if not devices:
+            raise Exception(f"Device not found (VID=0x{VID:04X} PID=0x{PID:04X})")
+        
+        # Prefer the interface with usage_page 65280 (Vendor Defined)
+        target_device = None
+        for d in devices:
+            if d['usage_page'] == 65280:
+                target_device = d
+                break
+        
+        if target_device:
+            print(f"Found vendor-defined interface (path: {target_device['path']})")
+            dev = hid.device()
+            dev.open_path(target_device['path'])
+        else:
+            print("Vendor-defined interface not found, trying default open...")
+            dev = hid.device()
+            dev.open(VID, PID)
+            
+        return dev
+    except Exception as e:
+        print(f"HID connection error: {e}")
+        raise
 
 def main():
     print("PXN Wheel Angle Test")
@@ -81,38 +93,36 @@ def main():
     dev = None
     try:
         dev = connect_device()
-        print("Device connected; interface claimed.")
+        print("Device connected.")
 
-        # Try sending via endpoint 1 (upgrade/command endpoint) first,
-        # then endpoint 131 (read endpoint) if needed.
-        # Note: pyusb write endpoint is the endpoint address (e.g., 0x01 for EP1 OUT).
-        # We attempt endpoint 1 (0x01) because profile writes use endpoint 3 (0x03),
-        # but angle is unverified; endpoint 1 is the safest speculative target.
+        # In hidapi, the first byte of the write buffer is treated as the Report ID.
+        # Our packet[0] is 131, which matches the report ID we want to send.
         try:
-            # Endpoint 1 OUT (address 0x01)
-            dev.write(0x01, packet, timeout=1000)
-            print("Packet sent to endpoint 0x01 (report 131).")
-        except usb.core.USBError as exc:
-            print("Endpoint 0x01 failed: %s" % exc)
-            # Fallback: try endpoint 3 (profile/config endpoint)
-            try:
-                dev.write(0x03, packet, timeout=1000)
-                print("Packet sent to endpoint 0x03 (profile/config).")
-            except usb.core.USBError as exc2:
-                print("Endpoint 0x03 also failed: %s" % exc2)
-                raise
+            dev.write(packet)
+            print("Packet sent via HID (Report ID 131).")
+        except Exception as exc:
+            print(f"HID write failed: {exc}")
+            raise
 
         # Small delay then attempt a read to verify device is responsive
         time.sleep(0.2)
         try:
-            # Read from endpoint 131 (0x83 IN) — 64 bytes, 1000ms timeout
-            data = dev.read(0x83, 64, timeout=1000)
-            print("Read back %d bytes from endpoint 0x83." % len(data))
-            if len(data) >= 3:
-                read_angle = data[1] + data[2] * 256
-                print("Current reported angle (bytes 1-2): 0x%04X (%d / 65535)" % (read_angle, read_angle))
-        except usb.core.USBError as exc:
-            print("Read back failed (device may not respond to this packet): %s" % exc)
+            # Read up to 64 bytes
+            data = dev.read(64)
+            if data:
+                print(f"Read back {len(data)} bytes.")
+                # Note: hidapi.read() usually strips the Report ID from the start.
+                # If the device sends [131, angle_l, angle_h, ...], 
+                # data will be [angle_l, angle_h, ...].
+                if len(data) >= 2:
+                    read_angle = data[0] + data[1] * 256
+                    print(f"Current reported angle (bytes 0-1): 0x{read_angle:04X} ({read_angle} / 65535)")
+                else:
+                    print(f"Read data too short: {data}")
+            else:
+                print("No data read back.")
+        except Exception as exc:
+            print(f"HID read failed: {exc}")
 
     except Exception as exc:
         print("ERROR: %s" % exc)
@@ -120,11 +130,10 @@ def main():
     finally:
         if dev is not None:
             try:
-                usb.util.release_interface(dev, 0)
-                usb.util.dispose_resources(dev)
-                print("Device released.")
+                dev.close()
+                print("Device closed.")
             except Exception as exc:
-                print("Cleanup warning: %s" % exc)
+                print(f"Cleanup warning: {exc}")
 
 if __name__ == "__main__":
     main()

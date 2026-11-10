@@ -51,7 +51,7 @@ def get_settings():
 @app.post("/api/settings")
 def update_setting(payload: SettingUpdate):
     """Update a single setting and send USB packet."""
-    ok = controller.update_setting(payload.setting_name, payload.value)
+    ok = controller.set_parameter(payload.setting_name, payload.value)
     return {"status": "ok" if ok else "error", "sent": ok, "setting": payload.setting_name}
 
 @app.get("/api/read")

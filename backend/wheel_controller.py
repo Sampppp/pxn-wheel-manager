@@ -1,326 +1,192 @@
 #!/usr/bin/env python3
 """
 backend/wheel_controller.py
-PXNController - object-oriented HID controller for PXN wheelbase.
-Re-analyzed from pxn_usb_decompiled.py and config_decompiled.py.
-
-Parameters identified (from jizuo_param_data / profile / read packets):
-- Spring (jizuo_param index 0)
-- Inertia (jizuo_param index 1)
-- Friction (jizuo_param index 2)
-- Center Force (jizuo_param index 3)
-- Mechanical Damper (jizuo_param index 4)
-- Game Force / FFB Gain (jizuo_param index 5, also read from endpoint 131 bytes 23-26)
-- Rotation Angle (read endpoint 131 bytes 1-2, uint16 / 65535)
-- Wind Speed Switch (profile byte 3 = 8)
-- Two-Pick Status (profile byte 3 = 7)
-- LED Profile (profile byte 3 = 2, bytes 4-33)
-- Map / Button Profile (profile byte 3 = 0, bytes 4-47)
-- Calibration Start/Stop (byte 3 = 1 / 2, command 253)
-- Shift Lever Map (map hex bytes 24-32)
-- Footrest Map / Coordinate (map hex / coord hex)
+PXNController - object-oriented USB controller for PXN wheelbase.
+Updated to use pyusb and the verified Control Gate (Interface 2, EP 3).
 """
 
 import threading
 import time
 import struct
+import usb.core
+import usb.util
+import libusb_package
 from typing import Optional, Dict, Any, List
 
-try:
-    import usb.core
-    import usb.util
-except ImportError as exc:
-    raise ImportError("pyusb is required. Install: pip install pyusb") from exc
-
-
 class PXNController:
-    """Robust HID controller for PXN V12/V10/Lite/PAN wheelbases."""
+    """Robust USB controller for PXN V12/V10/Lite/PAN wheelbases."""
 
-    VID = 0x11FF          # 4607 decimal (from config_decompiled.py)
-    PID = 0x1212          # 4626 decimal (V12)
-    REPORT_ID_CONFIG = 100  # profile/config report (from pxn_usb_decompiled.py)
-    REPORT_ID_CMD = 1      # command/upgrade report
+    VID = 0x11FF
+    PID = 0x1212
+    
+    # USB Topology
+    INTF_TELEMETRY = 0
+    EP_TELEMETRY_IN = 0x81
+    
+    INTF_CONTROL = 2
+    EP_CONTROL_OUT = 0x03
+    EP_CONTROL_IN = 0x83
+    
     PACKET_LEN = 58
     READ_REPORT_LEN = 64
-    READ_ENDPOINT = 131    # HID read endpoint (from pxn_usb_decompiled.py)
 
-    # Inferred parameter mapping from jizuo_param_data (13 bytes, indices 0-12)
-    # Based on standard PXN wheel parameter order observed in decompiled code.
+    # Parameter Mapping (Based on RE and Physical Testing)
+    # Offset is the byte position in the 58-byte packet
     PARAM_MAP = {
-        "Spring": 0,
-        "Inertia": 1,
-        "Friction": 2,
-        "Center_Force": 3,
-        "Mechanical_Damper": 4,
-        "Game_Force": 5,
-        "FFB_Gain": 5,        # alias for Game_Force
-        "Rotation_Angle": 6,  # not in jizuo_param; handled separately
+        "Angle": {"offset": 4, "type": "uint16"},
+        "Rotation_Angle": {"offset": 4, "type": "uint16"},
+        "Force_Feedback": {"offset": 6, "type": "byte"},
+        "FFB_Gain": {"offset": 6, "type": "byte"},
+        "Elasticity": {"offset": 7, "type": "byte"},
+        "Damping_Force": {"offset": 8, "type": "byte"},
+        "Sine_Force": {"offset": 9, "type": "byte"},
+        "Inertial_Force": {"offset": 10, "type": "byte"},
+        "Max_Torque": {"offset": 11, "type": "byte"},
+        "Max_Rotational_Speed": {"offset": 12, "type": "byte"},
+        "Mechanical_Centering_Force": {"offset": 13, "type": "byte"},
+        "Mechanical_Damping_Force": {"offset": 14, "type": "byte"},
+        "Road_Sensation_Perception": {"offset": 15, "type": "byte"},
+        "Mystery_Param": {"offset": 18, "type": "byte"},
     }
 
     def __init__(self):
-        self.device = None  # pyusb device
+        self.device = None
         self._connected = False
         self._lock = threading.RLock()
+        self.backend = libusb_package.get_libusb1_backend()
 
-        # Maintain current state of all configurable settings
+        # Current state of all configurable settings
         self.state: Dict[str, Any] = {
-            "Spring": 0,
-            "Inertia": 0,
-            "Friction": 0,
-            "Center_Force": 0,
-            "Mechanical_Damper": 0,
-            "Game_Force": 50,
-            "FFB_Gain": 50,
-            "Rotation_Angle": 540,
-            "Wind_Speed_Switch": 0,
-            "Two_Pick_Status": 0,
-            "LED_Profile": [0] * 30,
-            "Map_Profile": [0] * 44,
-            "Calibration_Active": False,
+            "Angle": 540,
+            "Force_Feedback": 50,
+            "Elasticity": 50,
+            "Damping_Force": 50,
+            "Sine_Force": 50,
+            "Inertial_Force": 50,
+            "Max_Torque": 50,
+            "Max_Rotational_Speed": 50,
+            "Mechanical_Centering_Force": 50,
+            "Mechanical_Damping_Force": 50,
+            "Road_Sensation_Perception": 50,
+            "Mystery_Param": 0,
         }
 
-    # ------------------------------------------------------------------
-    # Connection
-    # ------------------------------------------------------------------
-
-    def connect(self, retries: int = 3, delay: float = 0.5) -> bool:
-        """Open HID device with retry/backoff for busy/disconnected states."""
-        with self._lock:
-            if self._connected and self.device is not None:
-                return True
-            for attempt in range(1, retries + 1):
-                try:
-                    self.device = usb.core.find(idVendor=self.VID, idProduct=self.PID)
-                    if self.device is None:
-                        continue
-                    self.device.set_configuration()
-                    usb.util.claim_interface(self.device, 0)
-                    self._connected = True
-                    return True
-                    self.device.set_nonblocking(1)
-                    self._connected = True
-                    return True
-                except OSError as exc:
-                    msg = str(exc).lower()
-                    if "busy" in msg or "resource" in msg or "timeout" in msg:
-                        if attempt < retries:
-                            time.sleep(delay * attempt)
-                            continue
-                    self._connected = False
-                    self.device = None
-                    return False
-                except Exception as exc:
-                    self._connected = False
-                    self.device = None
-                    return False
-            return False
-
-    def disconnect(self) -> None:
+    def connect(self) -> bool:
+        """Connect to the device and perform the unlock sequence."""
         with self._lock:
             try:
-                if self.device is not None:
-                    usb.util.release_interface(self.device, 0)
-                    usb.util.dispose_resources(self.device)
-            except Exception:
-                pass
-            finally:
-                self.device = None
+                self.device = usb.core.find(idVendor=self.VID, idProduct=self.PID, backend=self.backend)
+                if self.device is None:
+                    print("Device not found.")
+                    return False
+
+                # Set configuration
+                self.device.set_configuration()
+
+                # Claim both interfaces
+                usb.util.claim_interface(self.device, self.INTF_TELEMETRY)
+                usb.util.claim_interface(self.device, self.INTF_CONTROL)
+
+                # Perform the mandatory unlock sequence
+                if self._initialize_device():
+                    self._connected = True
+                    print("PXN Wheelbase connected and unlocked.")
+                    return True
+                
+                return False
+            except Exception as e:
+                print(f"Connection error: {e}")
                 self._connected = False
-
-    def is_connected(self) -> bool:
-        with self._lock:
-            return self._connected and self.device is not None
-
-    # ------------------------------------------------------------------
-    # Internal packet builders (derived from pxn_usb_decompiled.py)
-    # ------------------------------------------------------------------
-
-    def _build_profile_packet(self, subcmd: int, payload: List[int]) -> bytearray:
-        """Build 58-byte profile/config packet: [100, 65, 224, subcmd, payload..., 0...]"""
-        pkt = bytearray(self.PACKET_LEN)
-        pkt[0] = 100
-        pkt[1] = 65
-        pkt[2] = 224
-        pkt[3] = subcmd
-        for i, val in enumerate(payload):
-            if 4 + i < self.PACKET_LEN:
-                pkt[4 + i] = int(val) & 0xFF
-        return pkt
-
-    def _build_jizuo_packet(self, data: List[int]) -> bytearray:
-        """Build jizuo parameter packet (pxn_jizuo_param_set logic)."""
-        pkt = bytearray(self.PACKET_LEN)
-        pkt[0] = 100
-        pkt[1] = 65
-        pkt[2] = 224
-        pkt[3] = 1  # jizuo param sub-command
-        # data[1] -> bytes 4-5 (uint16 little-endian)
-        r = int(data[1]) % 256
-        pkt[4] = r
-        pkt[5] = int((int(data[1]) - r) / 256)
-        # data[2..11] -> bytes 6-15
-        for i in range(2, 12):
-            if i - 2 + 6 < self.PACKET_LEN:
-                pkt[i - 2 + 6] = int(data[i]) & 0xFF
-        # data[12] -> byte 18
-        if len(data) > 12:
-            pkt[18] = int(data[12]) & 0xFF
-        return pkt
-
-    def _build_read_packet(self) -> bytearray:
-        """Placeholder for any write that mirrors read format (not verified for angle)."""
-        return bytearray(self.PACKET_LEN)
-
-    # ------------------------------------------------------------------
-    # Public update method
-    # ------------------------------------------------------------------
-
-    def update_setting(self, setting_name: str, value) -> bool:
-        """
-        Pack the correct byte array for the specific setting and send to wheelbase.
-        Returns True if packet sent successfully, False on error/disconnect.
-        """
-        if not self.is_connected():
-            # Attempt reconnect once
-            if not self.connect():
                 return False
 
+    def _initialize_device(self) -> bool:
+        """Executes the verified unlock sequence to enable control."""
         try:
-            setting = setting_name.strip()
+            # 1. Base Info Handshake
+            pkt = bytearray(self.PACKET_LEN)
+            pkt[0]=100; pkt[1]=129; pkt[2]=1
+            self.device.write(self.EP_CONTROL_OUT, pkt, timeout=1000)
+            time.sleep(0.1)
 
-            # --- Jizuo / FFB / Mechanical parameters ---
-            if setting in ("Spring", "Inertia", "Friction", "Center_Force",
-                           "Mechanical_Damper", "Game_Force", "FFB_Gain"):
-                idx = self.PARAM_MAP.get(setting, 0)
-                # Build 13-element jizuo data array (default zeros, set index)
-                data = [0] * 13
-                # Preserve existing state for other indices
-                current = self.state.get(setting, 0)
-                # If value is int, set directly; if dict, merge
-                if isinstance(value, int):
-                    data[idx] = value
-                elif isinstance(value, dict):
-                    for k, v in value.items():
-                        if k in self.PARAM_MAP:
-                            data[self.PARAM_MAP[k]] = v
-                else:
-                    data[idx] = int(value)
-                pkt = self._build_jizuo_packet(data)
-                self.state[setting] = value if isinstance(value, int) else data[idx]
-                return self._send_raw(pkt)
-
-            # --- Rotation Angle ---
-            elif setting == "Rotation_Angle":
-                angle = int(value)
-                self.state["Rotation_Angle"] = angle
-                # No verified write packet exists; send speculative profile packet
-                # with angle encoded in payload bytes 4-5 (uint16 / 65535 scale)
-                pkt = self._build_profile_packet(0, [
-                    angle & 0xFF, (angle >> 8) & 0xFF, 0, 0
-                ])
-                return self._send_raw(pkt)
-
-            # --- Profile / Map settings ---
-            elif setting == "LED_Profile":
-                self.state["LED_Profile"] = value
-                payload = [int(v) & 0xFF for v in value[:30]]
-                pkt = self._build_profile_packet(2, payload)
-                return self._send_raw(pkt)
-
-            elif setting == "Map_Profile":
-                self.state["Map_Profile"] = value
-                payload = [int(v) & 0xFF for v in value[:44]]
-                pkt = self._build_profile_packet(0, payload)
-                return self._send_raw(pkt)
-
-            elif setting == "Wind_Speed_Switch":
-                self.state["Wind_Speed_Switch"] = int(value)
-                pkt = self._build_profile_packet(8, [int(value) & 0xFF])
-                return self._send_raw(pkt)
-
-            elif setting == "Two_Pick_Status":
-                self.state["Two_Pick_Status"] = int(value)
-                pkt = self._build_profile_packet(7, [int(value) & 0xFF])
-                return self._send_raw(pkt)
-
-            # --- Calibration ---
-            elif setting == "Calibration_Start":
-                self.state["Calibration_Active"] = True
+            # 2. Profile Sequence [0, 2, 3, 4, 1]
+            for subcmd in [0, 2, 3, 4, 1]:
                 pkt = bytearray(self.PACKET_LEN)
-                pkt[0] = 100; pkt[1] = 253; pkt[2] = 1; pkt[3] = 1
-                return self._send_raw(pkt)
-
-            elif setting == "Calibration_Stop":
-                self.state["Calibration_Active"] = False
-                pkt = bytearray(self.PACKET_LEN)
-                pkt[0] = 100; pkt[1] = 253; pkt[2] = 2; pkt[3] = 2
-                return self._send_raw(pkt)
-
-            else:
-                raise ValueError(f"Unknown setting: {setting_name}")
-
-        except Exception as exc:
-            # Comprehensive error handling: disconnect on critical failure
-            try:
-                self.disconnect()
-            except Exception:
-                pass
-            return False
-
-    def _send_raw(self, packet: bytearray) -> bool:
-        """Send raw bytearray via pyusb with busy-device retry."""
-        if not self.is_connected():
-            return False
-        try:
-            # Endpoint 3 OUT (profile/config) — address 0x03
-            self.device.write(0x03, packet, timeout=500)
-            return True
-        except usb.core.USBError as exc:
-            msg = str(exc).lower()
-            if "busy" in msg or "resource" in msg or "timeout" in msg:
+                pkt[0]=100; pkt[1]=129; pkt[2]=224; pkt[3]=subcmd
+                self.device.write(self.EP_CONTROL_OUT, pkt, timeout=1000)
                 time.sleep(0.1)
-                try:
-                    self.device.write(0x03, packet, timeout=500)
-                    return True
-                except Exception:
-                    return False
-            return False
-        except Exception:
+            
+            return True
+        except Exception as e:
+            print(f"Initialization failed: {e}")
             return False
 
-    # ------------------------------------------------------------------
-    # Read / Monitor (from endpoint 131, 64 bytes)
-    # ------------------------------------------------------------------
+    def disconnect(self):
+        with self._lock:
+            try:
+                if self.device:
+                    usb.util.release_interface(self.device, self.INTF_TELEMETRY)
+                    usb.util.release_interface(self.device, self.INTF_CONTROL)
+                self.device = None
+            except:
+                pass
+            self._connected = False
+
+    def is_connected(self) -> bool:
+        return self._connected
+
+    def set_parameter(self, name: str, value: Any) -> bool:
+        """Set a specific wheelbase parameter by name."""
+        if name not in self.PARAM_MAP:
+            print(f"Unknown parameter: {name}")
+            return False
+
+        with self._lock:
+            if not self._connected:
+                if not self.connect(): return False
+
+            try:
+                param_info = self.PARAM_MAP[name]
+                offset = param_info["offset"]
+                p_type = param_info["type"]
+
+                pkt = bytearray(self.PACKET_LEN)
+                pkt[0] = 100
+                pkt[1] = 65
+                pkt[2] = 224
+                pkt[3] = 1 # Command ID for jizuo_param_set
+
+                if p_type == "uint16":
+                    pkt[offset] = int(value) & 0xFF
+                    pkt[offset+1] = (int(value) >> 8) & 0xFF
+                else:
+                    pkt[offset] = int(value) & 0xFF
+
+                self.device.write(self.EP_CONTROL_OUT, pkt, timeout=1000)
+                self.state[name] = value
+                return True
+            except Exception as e:
+                print(f"Error setting {name}: {e}")
+                return False
 
     def read_wheel_data(self) -> Optional[Dict[str, Any]]:
-        """Read 64-byte HID report from endpoint 131 and parse known fields."""
-        if not self.is_connected():
+        """Read telemetry from Interface 0, Endpoint 0x81."""
+        if not self._connected:
             return None
         try:
-            # hid.device.read(length) reads from the device; endpoint 131 is report 131
-            data = self.device.read(0x83, self.READ_REPORT_LEN, timeout=1000)
-            if data is None or len(data) < 27:
+            data = self.device.read(self.EP_TELEMETRY_IN, self.READ_REPORT_LEN, timeout=100)
+            if not data or len(data) < 26:
                 return None
-            # Rotation angle (bytes 1-2, little-endian uint16 / 65535)
-            angle_raw = data[1] + data[2] * 256
+            
+            angle_raw = data[0] + data[1] * 256
             angle_norm = round(angle_raw / 65535.0, 3)
-            # Game Force / FFB (bytes 23-26, int32 little-endian * 20.141601)
-            game_force_raw = struct.unpack("i", bytes(data[23:27]))[0]
+            
+            game_force_raw = struct.unpack("i", bytes(data[22:26]))[0]
             game_force = game_force_raw * 20.141601
-            # Motor IC (bytes 15-18)
-            ic_raw = struct.unpack("i", bytes(data[15:19]))[0]
-            ic = ic_raw * 20.141601
-            # IQ Voltage (bytes 19-20, int16)
-            iq_v = struct.unpack("h", bytes(data[19:21]))[0]
-            # Speed (bytes 21-22, int16)
-            speed = struct.unpack("h", bytes(data[21:23]))[0]
+            
             return {
                 "rotation_angle_raw": angle_raw,
                 "rotation_angle_norm": angle_norm,
                 "game_force": game_force,
-                "ic": ic,
-                "iq_voltage": iq_v,
-                "speed": speed,
                 "raw": bytes(data),
             }
         except Exception:
@@ -330,6 +196,10 @@ class PXNController:
         with self._lock:
             return dict(self.state)
 
-    def set_state(self, state_dict: Dict[str, Any]) -> None:
-        with self._lock:
-            self.state.update(state_dict)
+    def set_state(self, state_dict: Dict[str, Any]) -> bool:
+        """Update multiple parameters from a dictionary."""
+        success = True
+        for name, value in state_dict.items():
+            if not self.set_parameter(name, value):
+                success = False
+        return success
